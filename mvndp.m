@@ -13,10 +13,10 @@ km = 100;      % max number of global species (shouldn't come close to this max)
 count = 100;
 
 % p is the dimensions of the matrix
-p = 20;
+p = 2000;
 
 % Sample size: no of subjects
-n = 10;
+n = 1000;
 
 lambdapath = [linspace(0,0.005,100) linspace(0.0052,0.05,200) linspace(0.05,0.5,100)]; ll = length(lambdapath);
 threshpath = [0.3:0.01:0.7]; ll1 = length(threshpath);
@@ -35,17 +35,24 @@ q = p;
 burnin = 10000; nmc = 90000;
 b0=10; D0= .8*eye(q);
 
+% Time variables
+time1 = 0;
+time2 = 0;
+time3 = 0;
+time4 = 0;
+
 
 for lp= 26:count
-    if (lp<=25)
-        n = 100; p = 300; p1=p/6;
-    elseif (lp>25)
-        n=100; p=200; p1 = p/4;
-    end
+    % Suvodeep: Uncomment
+%     if (lp<=25)
+%         n = 100; p = 300; p1=p/6;
+%     elseif (lp>25)
+%         n=100; p=200; p1 = p/4;
+%     end
     
     %%%% AR(1) case
     SigmaT = toeplitz(0.7.^[0:p-1]);
-    OmegaT = inv(SigmaT);
+    OmegaT = inv(gpuArray(SigmaT));
     
     %%%% AR(2) case
     %OmegaT = toeplitz([1,0.5,0.25,zeros(1,p-3)]);
@@ -84,7 +91,9 @@ for lp= 26:count
     %%%%%%%%%%%% Data Generation %%%%%%%%%%%%%%%%%%%%
     Y = zeros(n,p);
     for ii=1:n
-        Y(ii,:)  = [-ones(1,p1) ones(1,p1) 2.5*ones(1,p1) -2.5*ones(1,p1)] + mvnrnd(zeros(1,p),SigmaT);
+        chol_SigmaT = gather(chol(gpuArray(SigmaT)));
+        % Y(ii,:)  = chol_SigmaT * mvnrnd(zeros(p,1),eye(p))';
+        Y(ii,:)  = chol_SigmaT * normrnd(0,1,[p 1]);
     end
     YY = Y;
     Y = (Y - repmat(mean(Y),[n 1]))./repmat(sqrt(var(Y)),[n 1]);
@@ -104,7 +113,7 @@ for lp= 26:count
         a = 1;                             % DP precision parameter
         ps = 10;                           % residual precision
         Tht = mvnrnd(zeros(1,n),eye(n),[km 1]);                 % initial atom values
-        ph = kmeans(YY',3,'replicates',100);  ph1 = ph; phk = ph;    % initial atoms allocation index
+        ph = kmeans(YY',50,'replicates',100);  ph1 = ph; phk = ph;    % initial atoms allocation index
         nn = 50*ones(p/50,1);
         nus = betarnd(1,a,[1 km]);         % stick-breaking random variables
         nu = nus.*cumprod([1 1-nus(:,1:km-1)]); % category probabilities
@@ -144,8 +153,8 @@ for lp= 26:count
         
         % -- update allocation to atoms -- %
         %% Suvodeep: Step 1: Parallelize on l
-        disp('Step 1 Execution');
-        tic
+        %disp('Step 1 Execution');
+        tic;
         pih = -10000000*ones(p,h);       % probabilities of allocation to each atom for each subject
         R = zeros(p,h);             % indexes which atoms are available to each subject (depends on their u)
         for l = 1:h
@@ -157,34 +166,45 @@ for lp= 26:count
         pih = pih./repmat(pih*ones(h,1),[1 h]);                  % normalize
         pih = [zeros(p,1) cumsum(pih')'];
         r = unifrnd(0,1,[p,1]);
-        toc
+        time1 = time1 + toc;
         
         %% Suvodeep: Step 2: Parallelize on l
-        disp('Step 2 Execution');
-        tic
+        %disp('Step 2 Execution');
+        tic;
         for l = 1:h
             ind = (r>pih(:,l) )&(r<=pih(:,l+1) );
             ph(ind) = l;
             tht(:,ind) = repmat(Tht(l,:)',[1 sum(ind)]);
         end
-        toc
+        time2 = time2 + toc;
         
         % -- Update atoms -- %
         %% Suvodeep: Step 3: Parallelize on l
         % ph : Cluster membership
         % h is basically an iterator (like l)
-        disp('Step 3 Execution');
-        tic
+        %disp('Step 3 Execution');
+        tic;
         for h = 1:max(ph)
             if (sum(ph==h)>0)
-                Vtht = inv(Ptht0 + ps*sum(ph==h)*eye(n) );
-                A = chol(Vtht); Vtht = A'*A;
+                invCoVarMat = Ptht0 + ps*sum(ph==h)*eye(n);
+                Vtht = inv(invCoVarMat);
+                
+                g_invCoVarMat = gpuArray(invCoVarMat);
+                g_Vtht = inv(g_invCoVarMat);
+                
+                sum(sum(Vtht - g_Vtht))
+                
+                % A = chol(Vtht); 
+                % Vtht = A'*A;
+                Vtht = (Vtht + Vtht')/2;
                 Etht = Vtht*(Ptht0*tht0 + ps*sum(Y(:,ph==h) - repmat(alpha(ph==h),[n 1]),2));
-                Tht(h,:) = mvnrnd(Etht,Vtht);
+                % Suvodeep: p should be the dimension
+                chol_Vtht = gather(chol(gpuArray(Vtht)));
+                Tht(h,:) = chol_Vtht * mvnrnd(zeros(p,1),eye(p))' + Etht;
                 tht(:,ph==h) = repmat(Tht(h,:)',[1 sum(ph==h)]);
             end
         end
-        toc
+        time3 = time3 + toc;
         
         Ptht0 = 0.01*eye(n);
         % -- Update residual precision psi -- %
@@ -197,8 +217,8 @@ for lp= 26:count
         a = gamrnd(aa + length(unique(ph)),1./(ba - sum(log(1-nus(1:kjs)))));
         
         %% Suvodeep: Parallelize on kk
-        disp('Step 4 Execution');
-        tic
+        %disp('Step 4 Execution');
+        tic;
         nn = zeros(max(ph),1);
         for kk=1:max(ph)
             nn(kk) = sum(ph==kk);
@@ -211,7 +231,7 @@ for lp= 26:count
             Ealpha1 = Valpha1*(ps.*sum(Y(:,ph==kk)-tht(:,ph==kk))');
             alpha(ph==kk) = mvnrnd(Ealpha1,Valpha1);
         end
-        toc
+        time4 = time4 + toc;
         
         Omega = (Omega + Omega')/2;
         prec = diag(Omega);
@@ -223,10 +243,19 @@ for lp= 26:count
         %al1 = al + b*p/2;
         %lambda = gamrnd(al1,1./bl1)';
         
-        dummy = Omega(1,1:p);
-        for j=2:p
-            dummy = [dummy Omega(j,j:p)];
+        %Suvodeep : Replacing block with more efficient code below.
+%         dummy = Omega(1,1:p);
+%         for j=2:p
+%             dummy = [dummy Omega(j,j:p)];
+%         end
+        
+        rowMajor = zeros(1, p * (p + 1) / 2);
+        cummIdx = 1; % Cummulative Index
+        for ii = 1:p
+            rowMajor(1, cummIdx:cummIdx + p - ii) = Omega(ii, ii:p);
+            cummIdx = cummIdx + p - ii + 1;
         end
+        dummy = rowMajor;
         
         % -- save sampled values (after thinning) -- %
         if mod(g,thin)==0
